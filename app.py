@@ -79,8 +79,35 @@ st.sidebar.caption("Every tab below always shows **all 6 stores × all 3 SKUs** 
 
 stores_selected = STORES
 product_ids_selected = PRODUCTS["Product_ID"].tolist()
-filtered_df = df
 products_selected_df = PRODUCTS
+
+# ---------------------------------------------------------------------------
+# Live Simulation state: initialised HERE (before any tab renders) so that if
+# it has been run, EVERY tab below - not just the Live Simulation tab itself -
+# transparently switches to reading the simulated timeline. This is what makes
+# "Live Simulation drives everything" actually true: `df` and `AS_OF_DATE` are
+# reassigned once, and every tab downstream already just reads those two
+# variables, so nothing else needs to change.
+# ---------------------------------------------------------------------------
+if "sim_state" not in st.session_state:
+    st.session_state.sim_state = simulation.init_simulation_state(df, STORES, PRODUCTS, AS_OF_DATE, seed=None)
+if "sim_autoplay" not in st.session_state:
+    st.session_state.sim_autoplay = False
+if "sim_speed" not in st.session_state:
+    st.session_state.sim_speed = 1.5
+
+HISTORICAL_DF = df               # kept for reference/reset purposes only
+HISTORICAL_AS_OF_DATE = AS_OF_DATE
+LIVE_MODE = st.session_state.sim_state["days_simulated"] > 0
+
+if LIVE_MODE:
+    df = simulation.extended_dataframe(HISTORICAL_DF, st.session_state.sim_state["log"], PRODUCTS)
+    AS_OF_DATE = st.session_state.sim_state["sim_date"]
+    safety_stock_rates = simulation.current_safety_stock_rates(st.session_state.sim_state)
+else:
+    safety_stock_rates = {}
+
+filtered_df = df  # re-bound AFTER the possible LIVE_MODE reassignment above, so it stays in sync
 
 # ---------------------------------------------------------------------------
 # Stock Intake ledger (session-only): manually logged stock receipts that
@@ -99,6 +126,16 @@ def _stock_adjustments_dict():
 
 stock_adjustments = _stock_adjustments_dict()
 
+if LIVE_MODE:
+    st.success(
+        f"🔴 **LIVE MODE ACTIVE** — the simulation has run **{st.session_state.sim_state['days_simulated']} day(s)** "
+        f"forward, to **{AS_OF_DATE.date()}**. Every tab below (Overview, Movement, Forecasting, Inventory, "
+        f"Lead-Time, Expiry, Reorder, Risk) now reads this extended, simulated timeline — including each "
+        f"combo's **adaptively learned safety-stock rate** instead of the fixed 20% baseline. Go to "
+        f"**🔴 Live Simulation** to advance further or reset back to the real historical data only.",
+        icon="🔴",
+    )
+
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
@@ -115,8 +152,8 @@ tab_overview, tab_movement, tab_forecast, tab_ml, tab_inventory, tab_intake, tab
 # Pre-compute the risk table and the full all-store x all-SKU snapshot once (reused across tabs).
 # Both incorporate any manually logged Stock Intake adjustments, so a manual entry genuinely
 # changes every recommendation across the app, not just what's displayed on one tab.
-risk_table = build_risk_table(df, stores_selected, products_selected_df, AS_OF_DATE, forecast_period, stock_adjustments)
-full_table = build_full_snapshot_table(df, STORES, PRODUCTS, AS_OF_DATE, forecast_period, stock_adjustments)
+risk_table = build_risk_table(df, stores_selected, products_selected_df, AS_OF_DATE, forecast_period, stock_adjustments, safety_stock_rates)
+full_table = build_full_snapshot_table(df, STORES, PRODUCTS, AS_OF_DATE, forecast_period, stock_adjustments, safety_stock_rates)
 
 
 def _risk_style(val):
@@ -400,36 +437,87 @@ with tab_intake:
     st.write(
         "Log stock as it's physically received. Every entry here is added directly to that "
         "Store × SKU's Current Stock and immediately flows through to Lead-Time, Reorder, "
-        "Risk and every other tab in this app — it's a real adjustment, not just a note."
+        "Risk and every other tab in this app — it's a real adjustment, not just a note. "
+        "**The quantity below updates its own overstock check live, before you submit anything.**"
     )
 
-    with st.form("stock_intake_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            intake_store = st.selectbox("Store", STORES)
-        with c2:
-            intake_product_label = st.selectbox("Product", PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"])
-        with c3:
-            intake_qty = st.number_input("Quantity received", min_value=1, step=1, value=50)
-        intake_note = st.text_input("Note (optional)", placeholder="e.g. delivery from supplier, manual correction")
-        submitted = st.form_submit_button("➕ Log stock receipt")
+    product_labels = list(PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"])
 
-        if submitted:
-            intake_sku = intake_product_label.split(" – ")[0]
-            intake_name = PRODUCTS.loc[PRODUCTS["Product_ID"] == intake_sku, "Product_Name"].iloc[0]
-            st.session_state.stock_ledger.append({
-                "Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
-                "Store": intake_store, "SKU": intake_sku, "Product": intake_name,
-                "Quantity": int(intake_qty), "Note": intake_note,
-            })
-            # Pre-set the AI Assessment widgets' own keyed state directly (not just a plain
-            # session_state value) - Streamlit ignores a selectbox's `index=` argument on
-            # reruns once the widget has already rendered once, so this is the correct way
-            # to make the assessment below jump to whatever was just logged.
-            st.session_state["assess_store"] = intake_store
-            st.session_state["assess_product"] = intake_product_label
-            st.success(f"Logged +{intake_qty} units of {intake_name} at {intake_store}. Every tab now reflects this.")
-            st.rerun()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        intake_store = st.selectbox("Store", STORES, key="intake_store")
+    with c2:
+        intake_product_label = st.selectbox("Product", product_labels, key="intake_product")
+    intake_sku = intake_product_label.split(" – ")[0]
+    intake_name = PRODUCTS.loc[PRODUCTS["Product_ID"] == intake_sku, "Product_Name"].iloc[0]
+
+    # What this combo's numbers look like RIGHT NOW, before this pending entry
+    row_now = full_table[(full_table["Store"] == intake_store) & (full_table["SKU"] == intake_sku)]
+    fdlt = float(row_now.iloc[0]["Forecast_During_Lead_Time"]) if not row_now.empty else 0.0
+    safety = float(row_now.iloc[0]["Safety_Stock"]) if not row_now.empty else 0.0
+    current_before = float(row_now.iloc[0]["Current_Stock"]) if not row_now.empty else 0.0
+    overstock_threshold_now = 2.0 * fdlt if fdlt > 0 else None
+    suggested_max = max(0, round(overstock_threshold_now - current_before)) if overstock_threshold_now is not None else None
+
+    with c3:
+        default_qty = min(50, suggested_max) if suggested_max else 50
+        intake_qty = st.number_input(
+            "Quantity received", min_value=1, step=1, value=st.session_state.get("intake_qty", default_qty), key="intake_qty",
+        )
+    intake_note = st.text_input("Note (optional)", placeholder="e.g. delivery from supplier, manual correction", key="intake_note")
+
+    # ---- LIVE pre-submit preview: does THIS quantity overstock it? ----------
+    if fdlt <= 0:
+        st.info("No demand forecast available yet for this combination — can't preview overstock risk.")
+    else:
+        hypothetical_stock = current_before + intake_qty
+        preview = assess_stock_position(hypothetical_stock, fdlt, safety)
+        if preview["status"] == "Overstocked":
+            over_by = hypothetical_stock - preview["overstock_threshold"]
+            st.warning(
+                f"⚠️ **This would overstock it.** Logging {intake_qty:.0f} units brings {intake_name} at "
+                f"{intake_store} to {hypothetical_stock:.0f} units — {over_by:.0f} above the "
+                f"{preview['overstock_threshold']:.0f}-unit overstock threshold. "
+                + (f"Suggested max right now: **{suggested_max} units**." if suggested_max is not None else ""),
+                icon="⚠️",
+            )
+        elif preview["status"] == "Below Target":
+            st.info(
+                f"This brings stock to {hypothetical_stock:.0f} units — covers the lead time but still "
+                f"below the {preview['reorder_point']:.0f}-unit healthy target. Not overstocking; could "
+                f"safely take more if available.",
+                icon="ℹ️",
+            )
+        elif preview["status"] == "Understocked":
+            st.info(
+                f"This brings stock to only {hypothetical_stock:.0f} units — still below the "
+                f"{fdlt:.0f}-unit bare minimum for the lead time. No overstock risk at all here.",
+                icon="ℹ️",
+            )
+        else:
+            st.success(
+                f"✅ **Looks right.** Logging {intake_qty:.0f} units brings stock to {hypothetical_stock:.0f} — "
+                f"comfortably between the {fdlt:.0f}-unit minimum and the {preview['overstock_threshold']:.0f}-unit "
+                f"overstock threshold.",
+                icon="✅",
+            )
+
+    if st.button("➕ Log stock receipt", type="primary"):
+        st.session_state.stock_ledger.append({
+            "Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "Store": intake_store, "SKU": intake_sku, "Product": intake_name,
+            "Quantity": int(intake_qty), "Note": intake_note,
+        })
+        # Pre-set every relevant widget's own keyed state directly (not just a plain
+        # session_state value) - Streamlit ignores a widget's `index=`/`value=` argument
+        # on reruns once it has already rendered once, so this is the correct way to
+        # reset the form and jump the AI Assessment below to what was just logged.
+        st.session_state["assess_store"] = intake_store
+        st.session_state["assess_product"] = intake_product_label
+        st.session_state["intake_qty"] = 50
+        st.session_state["intake_note"] = ""
+        st.success(f"Logged +{intake_qty} units of {intake_name} at {intake_store}. Every tab now reflects this.")
+        st.rerun()
 
     st.divider()
     st.markdown("### 🤖 AI Stock Assessment")
@@ -439,7 +527,6 @@ with tab_intake:
         "model, no new assumptions — and turns them into a plain-language verdict."
     )
 
-    product_labels = list(PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"])
     ac1, ac2 = st.columns(2)
     with ac1:
         assess_store = st.selectbox("Store", STORES, key="assess_store")
@@ -473,11 +560,14 @@ with tab_intake:
 
         if r["Manual_Adjustment"]:
             st.caption(f"Includes +{r['Manual_Adjustment']:.0f} units logged via Stock Intake for {assess_product_label.split(' – ')[1]} at {assess_store}.")
+        if LIVE_MODE:
+            rate_used = r.get("Safety_Stock_Rate", 0.20)
+            st.caption(f"Using this combo's current **learned** safety-stock rate of {rate_used:.0%} (Live Mode active), not the fixed 20% baseline.")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Current Stock", f"{verdict['current_stock']:.0f}")
         m2.metric("Forecast During Lead Time", f"{verdict['forecast_during_lead_time']:.0f}")
-        m3.metric("Reorder Point (+20% safety)", f"{verdict['reorder_point']:.0f}")
+        m3.metric("Reorder Point", f"{verdict['reorder_point']:.0f}")
         m4.metric("Overstock Threshold (2×)", f"{verdict['overstock_threshold']:.0f}" if verdict['overstock_threshold'] else "—")
 
         if verdict["overstock_threshold"]:
@@ -637,7 +727,14 @@ with tab_reorder:
     st.subheader("Demand-Based Reorder Recommendation — All Stores × All SKUs")
 
     st.markdown("**Formula:** `Recommended Order = Forecasted Demand During Lead Time + Safety Stock − Current Stock − Incoming Stock`")
-    st.markdown("**Safety Stock = 20% of Forecasted Demand During Lead Time**")
+    if LIVE_MODE:
+        st.markdown(
+            "**Safety Stock = adaptively learned rate × Forecasted Demand During Lead Time** "
+            "— each combo's own rate below, starting at 20% and adjusted by the Live Simulation "
+            "based on real stockout/overstock outcomes (see 🔴 Live Simulation → Learning Curve)."
+        )
+    else:
+        st.markdown("**Safety Stock = 20% of Forecasted Demand During Lead Time** (fixed baseline — run the Live Simulation to switch to an adaptively learned rate per combo)")
     st.caption(
         "The system recommends an order whenever available inventory (plus what's already inbound) "
         "is below the expected demand requirement during the replenishment period."
@@ -649,14 +746,20 @@ with tab_reorder:
     m1.metric("Total Recommended Reorder (network)", f"{total_recommended:,.0f} units")
     m2.metric("Store × SKU combos needing an order", f"{combos_needing_order} / {len(full_table)}")
 
-    reorder_display = full_table[[
-        "Store", "Product", "SKU", "Forecast_During_Lead_Time", "Safety_Stock",
-        "Current_Stock", "Incoming_Stock_Estimate", "Raw_Calculation", "Recommended_Order", "Risk",
-    ]].rename(columns={
-        "Forecast_During_Lead_Time": "Forecast During Lead Time", "Safety_Stock": "Safety Stock (20%)",
-        "Current_Stock": "Current Stock", "Incoming_Stock_Estimate": "Incoming Stock (est.)",
-        "Raw_Calculation": "Raw Calculation", "Recommended_Order": "Recommended Order",
+    reorder_cols = ["Store", "Product", "SKU", "Forecast_During_Lead_Time"]
+    rename_map = {"Forecast_During_Lead_Time": "Forecast During Lead Time"}
+    if LIVE_MODE:
+        reorder_cols.append("Safety_Stock_Rate")
+        rename_map["Safety_Stock_Rate"] = "Learned Safety Rate"
+    reorder_cols += ["Safety_Stock", "Current_Stock", "Incoming_Stock_Estimate", "Raw_Calculation", "Recommended_Order", "Risk"]
+    rename_map.update({
+        "Safety_Stock": "Safety Stock", "Current_Stock": "Current Stock",
+        "Incoming_Stock_Estimate": "Incoming Stock (est.)", "Raw_Calculation": "Raw Calculation",
+        "Recommended_Order": "Recommended Order",
     })
+    reorder_display = full_table[reorder_cols].rename(columns=rename_map)
+    if "Learned Safety Rate" in reorder_display.columns:
+        reorder_display["Learned Safety Rate"] = reorder_display["Learned Safety Rate"].map(lambda r: f"{r:.0%}")
     st.dataframe(reorder_display.style.map(_risk_style, subset=["Risk"]), use_container_width=True, hide_index=True)
 
     if combos_needing_order > 0:
@@ -708,22 +811,16 @@ with tab_live:
     st.subheader("Live Simulation — Full Store Network")
     st.info(
         "This simulates ongoing daily grocery operations **forward** from the end of the "
-        "real historical dataset (i.e. from " + str(AS_OF_DATE.date()) + " onward). Each simulated "
-        "day's demand is synthetically generated from patterns learned from the real 2024-2025 "
-        "history for each Store+SKU (recent average daily sales, day-of-week seasonality, "
-        "promotion effect size) plus random day-to-day variation — **it is not real sales data**. "
-        "The same 7-day moving-average forecast, lead-time-aware reorder formula and risk "
-        "classification used elsewhere in this app run automatically every simulated day, so you "
-        "can watch demand-based reordering actually trigger and restocks actually arrive.",
+        "real historical dataset. Each simulated day's demand is synthetically generated from "
+        "patterns learned from the real 2024-2025 history for each Store+SKU (recent average "
+        "daily sales, day-of-week seasonality, promotion effect size) plus random day-to-day "
+        "variation — **it is not real sales data**. The same forecast and reorder logic used "
+        "elsewhere in this app runs automatically every simulated day — but here, each combo's "
+        "**safety-stock rate adapts** based on what actually happens (see Learning Curve below), "
+        "instead of staying fixed at 20%. **Once this simulation has run, every other tab in the "
+        "app switches to this extended, live timeline** — this is the main driver of the whole app.",
         icon="🔴",
     )
-
-    if "sim_state" not in st.session_state:
-        st.session_state.sim_state = simulation.init_simulation_state(df, STORES, PRODUCTS, AS_OF_DATE, seed=None)
-    if "sim_autoplay" not in st.session_state:
-        st.session_state.sim_autoplay = False
-    if "sim_speed" not in st.session_state:
-        st.session_state.sim_speed = 1.5
 
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1.4, 1])
     with ctrl1:
@@ -736,12 +833,16 @@ with tab_live:
         st.session_state.sim_autoplay = st.toggle("Auto-play", value=st.session_state.sim_autoplay)
 
     if reset_clicked:
-        st.session_state.sim_state = simulation.init_simulation_state(df, STORES, PRODUCTS, AS_OF_DATE, seed=None)
+        # Reset always returns to the REAL historical data as the baseline, never the
+        # currently-extended live timeline - otherwise "reset" would just re-anchor on
+        # top of itself instead of genuinely starting over.
+        st.session_state.sim_state = simulation.init_simulation_state(HISTORICAL_DF, STORES, PRODUCTS, HISTORICAL_AS_OF_DATE, seed=None)
         st.session_state.sim_autoplay = False
         st.rerun()
 
     if next_day_clicked:
         st.session_state.sim_state = simulation.simulate_next_day(st.session_state.sim_state)
+        st.rerun()  # forces every tab (not just this one) to immediately reflect the new day
 
     sim_state = st.session_state.sim_state
     sim_log = sim_state["log"]
@@ -750,7 +851,7 @@ with tab_live:
                 f"**Days simulated:** {sim_state['days_simulated']}")
 
     if sim_log.empty:
-        st.warning("No simulated days yet — click **Next Day** or turn on **Auto-play** to begin.")
+        st.warning("No simulated days yet — click **Next Day** or turn on **Auto-play** to begin. Learning needs a track record to work from, so give it a few days.")
     else:
         latest_date = sim_log["Date"].max()
         today_log = sim_log[sim_log["Date"] == latest_date]
@@ -766,29 +867,88 @@ with tab_live:
         st.markdown("**Today's snapshot — all stores × SKUs**")
 
         show_cols = ["Store", "Product_Name", "Opening_Stock", "Incoming_Stock", "Units_Sold",
-                     "Closing_Stock", "Wastage", "Stockout", "Recommended_Order", "Risk"]
+                     "Closing_Stock", "Wastage", "Stockout", "Safety_Stock_Rate", "Recommended_Order", "Risk"]
         st.dataframe(
-            today_log[show_cols].rename(columns={"Product_Name": "Product"}).style.map(_risk_style, subset=["Risk"]),
+            today_log[show_cols].rename(columns={"Product_Name": "Product", "Safety_Stock_Rate": "Safety Rate Used"}).style.map(_risk_style, subset=["Risk"]),
             use_container_width=True, hide_index=True,
         )
 
         st.caption(
-            "**Reading this table:** 'Risk' is a leading, forward-looking flag based on whether "
-            "on-hand + already-ordered stock covers a full lead-time cycle under the 20% safety-stock "
-            "policy. 'Stockout' shows whether that SPECIFIC day's actual demand was fully met. With a "
-            "lean 20% safety margin and short 1-2 day lead times, 'Stockout Risk' can flag often as an "
-            "early warning even while actual demand keeps getting met most days — the two metrics below "
-            "make that gap visible, which is a genuine discussion point for Sprint 3 (e.g. would a higher "
-            "safety-stock % reduce false-positive risk flags at the cost of holding more stock?)."
+            "**Reading this table:** 'Safety Rate Used' is what that combo's ADAPTIVE safety-stock "
+            "rate was on this specific day (starts at 20%, learns from there — see below). 'Risk' is "
+            "a leading, forward-looking flag; 'Stockout' shows whether that day's actual demand was "
+            "fully met. As the learned rate rises for a combo, both should fall over time."
         )
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             actual_stockout_rate = (sim_log["Stockout"] == "Yes").mean()
-            st.metric("Actual demand-unmet rate (measured, all days simulated)", f"{actual_stockout_rate:.1%}")
+            st.metric("Actual demand-unmet rate (all days simulated)", f"{actual_stockout_rate:.1%}")
         with c2:
             risk_flag_rate = (sim_log["Risk"] != "Normal").mean()
-            st.metric("Risk-flag rate (leading indicator, all days simulated)", f"{risk_flag_rate:.1%}")
+            st.metric("Risk-flag rate (all days simulated)", f"{risk_flag_rate:.1%}")
+        with c3:
+            current_rates = simulation.current_safety_stock_rates(sim_state)
+            avg_rate = sum(current_rates.values()) / len(current_rates) if current_rates else 0
+            st.metric("Current avg. learned safety rate", f"{avg_rate:.0%}", delta=f"{avg_rate-0.20:+.0%} vs 20% baseline")
+
+        # ===================================================================
+        # LEARNING CURVE — the actual evidence the machine is learning
+        # ===================================================================
+        st.divider()
+        st.markdown("## 📈 Learning Curve — Is It Actually Learning to Avoid Stockouts?")
+        st.write(
+            "Each combo's safety-stock rate starts at the fixed 20% baseline. Every time it actually "
+            "stocks out, its rate is raised (×1.35). Every time it closes comfortably overstocked with "
+            "no stockout, its rate is gently eased back down (×0.97). This chart is the honest test of "
+            "whether that's working: the network's rolling stockout rate should trend down over time."
+        )
+
+        learning_curve = simulation.rolling_stockout_rate(sim_log, window=7)
+        fig_learn = go.Figure()
+        fig_learn.add_trace(go.Scatter(x=learning_curve["Date"], y=learning_curve["Stockout_Rate"],
+                                        name="Daily stockout rate (raw)", mode="markers",
+                                        marker=dict(color="#d62728", size=5, opacity=0.4)))
+        fig_learn.add_trace(go.Scatter(x=learning_curve["Date"], y=learning_curve["Rolling_Stockout_Rate"],
+                                        name="7-day rolling average — the learning curve",
+                                        line=dict(color="#2ca02c", width=3)))
+        fig_learn.update_layout(title="Network Stockout Rate Over Time (should trend down as it learns)",
+                                xaxis_title="Simulated Date", yaxis_title="Stockout Rate",
+                                yaxis_tickformat=".0%", legend=dict(orientation="h", y=-0.25))
+        st.plotly_chart(fig_learn, use_container_width=True)
+
+        if sim_state["days_simulated"] >= 14:
+            first_week = learning_curve["Stockout_Rate"].head(7).mean()
+            last_week = learning_curve["Stockout_Rate"].tail(7).mean()
+            if last_week < first_week:
+                st.success(
+                    f"**It's learning.** First 7 simulated days averaged a {first_week:.1%} daily stockout "
+                    f"rate; the most recent 7 days average {last_week:.1%} — a real, measured improvement "
+                    f"from the adaptive safety-stock rule, not an assumption."
+                )
+            else:
+                st.warning(
+                    f"No clear improvement yet ({first_week:.1%} → {last_week:.1%}) — this can happen with "
+                    f"only a short run, or for combos with high day-to-day demand volatility that need a "
+                    f"larger buffer than the current cap allows. Keep running the simulation to see if it "
+                    f"continues to adapt."
+                )
+        else:
+            st.caption(f"Run at least 14 simulated days to see a first/last week comparison (currently {sim_state['days_simulated']}).")
+
+        st.markdown("**Current learned safety-stock rate — every store × SKU**")
+        rate_rows = []
+        for (store, sku), rate in simulation.current_safety_stock_rates(sim_state).items():
+            prod_name = PRODUCTS.loc[PRODUCTS["Product_ID"] == sku, "Product_Name"].iloc[0]
+            rate_rows.append({"Store": store, "Product": prod_name, "SKU": sku,
+                              "Learned Safety Rate": f"{rate:.0%}", "vs 20% Baseline": f"{rate-0.20:+.0%}"})
+        st.dataframe(pd.DataFrame(rate_rows).sort_values("vs 20% Baseline", ascending=False), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "⬇️ Download full learning log (CSV) — the curve, saved",
+            data=sim_state["learning_log"].to_csv(index=False),
+            file_name="colonial_fresh_learning_log.csv", mime="text/csv",
+        )
 
         st.divider()
         st.markdown("**Network trends across the simulation**")

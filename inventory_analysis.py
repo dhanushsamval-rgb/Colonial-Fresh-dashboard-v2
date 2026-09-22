@@ -123,15 +123,18 @@ def expiry_metrics(df: pd.DataFrame, store: str, product_id: str, as_of_date: pd
 
 
 def calculate_reorder(
-    forecasted_demand_during_lead_time: float, current_stock: float, incoming_stock: float
+    forecasted_demand_during_lead_time: float, current_stock: float, incoming_stock: float,
+    safety_stock_rate: float = SAFETY_STOCK_RATE,
 ) -> dict:
     """
     Recommended Order = Forecasted Demand During Lead Time + Safety Stock
                          - Current Stock - Incoming Stock
-    Safety Stock = 20% of Forecasted Demand During Lead Time.
+    Safety Stock = safety_stock_rate x Forecasted Demand During Lead Time
+    (defaults to the fixed 20% rate; the Live Simulation passes its own
+    per-combo LEARNED rate here once adaptive learning has kicked in).
     Negative results are floored at 0.
     """
-    safety_stock = SAFETY_STOCK_RATE * forecasted_demand_during_lead_time
+    safety_stock = safety_stock_rate * forecasted_demand_during_lead_time
     raw_order = forecasted_demand_during_lead_time + safety_stock - current_stock - incoming_stock
     recommended_order = max(0, round(raw_order))
     return {
@@ -227,7 +230,7 @@ def assess_stock_position(
 
 def build_full_snapshot_table(
     df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int,
-    stock_adjustments: dict = None,
+    stock_adjustments: dict = None, safety_stock_rates: dict = None,
 ) -> pd.DataFrame:
     """
     Build ONE comprehensive table covering every Store x SKU combination, with every
@@ -244,8 +247,15 @@ def build_full_snapshot_table(
     the dataset's Current_Stock (Closing_Stock) figure before any downstream
     lead-time, reorder or risk calculation, so a manual stock entry genuinely
     changes what the rest of the app recommends - it isn't just a display note.
+
+    `safety_stock_rates`, if given, is a {(store, product_id): rate} dict of
+    per-combo ADAPTIVE safety-stock rates learned by the Live Simulation (falls
+    back to the fixed 20% rate for any combo not present), so once the simulation
+    has learned something about a combo's real stockout risk, every tab's reorder
+    figure reflects that learning - not just the Live Simulation tab.
     """
     stock_adjustments = stock_adjustments or {}
+    safety_stock_rates = safety_stock_rates or {}
     rows = []
     for store in stores:
         for _, prod in products.iterrows():
@@ -260,8 +270,10 @@ def build_full_snapshot_table(
             lt["Current_Stock"] = lt["Current_Stock"] + adjustment
 
             exp = expiry_metrics(df, store, product_id, as_of_date)
+            rate = safety_stock_rates.get((store, product_id), SAFETY_STOCK_RATE)
             reorder = calculate_reorder(
-                lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"]
+                lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"],
+                safety_stock_rate=rate,
             )
             risk = classify_risk(
                 lt["Current_Stock"], lt["Forecasted_Demand_During_Lead_Time"], exp.get("Days_Remaining", 999)
@@ -288,6 +300,7 @@ def build_full_snapshot_table(
                 "Forecast_During_Lead_Time": round(lt["Forecasted_Demand_During_Lead_Time"], 1),
                 "Incoming_Stock_Estimate": round(lt["Incoming_Stock_Estimate"], 1),
                 # Reorder calculation (full breakdown)
+                "Safety_Stock_Rate": rate,
                 "Safety_Stock": round(reorder["Safety_Stock"], 1),
                 "Raw_Calculation": round(reorder["Raw_Calculation"], 1),
                 "Recommended_Order": reorder["Recommended_Order"],
@@ -303,15 +316,16 @@ def build_full_snapshot_table(
 
 def build_risk_table(
     df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int,
-    stock_adjustments: dict = None,
+    stock_adjustments: dict = None, safety_stock_rates: dict = None,
 ) -> pd.DataFrame:
     """
     Build the full Risk Dashboard table:
     SKU | Movement | Store | Current Stock | Forecast | Lead Time | Expiry | Risk | Recommended Order
     Populated dynamically for every store x SKU combination in scope. `stock_adjustments`
-    behaves exactly as in build_full_snapshot_table.
+    and `safety_stock_rates` behave exactly as in build_full_snapshot_table.
     """
     stock_adjustments = stock_adjustments or {}
+    safety_stock_rates = safety_stock_rates or {}
     rows = []
     for store in stores:
         for _, prod in products.iterrows():
@@ -323,8 +337,10 @@ def build_risk_table(
             lt["Current_Stock"] = lt["Current_Stock"] + stock_adjustments.get((store, product_id), 0)
 
             exp = expiry_metrics(df, store, product_id, as_of_date)
+            rate = safety_stock_rates.get((store, product_id), SAFETY_STOCK_RATE)
             reorder = calculate_reorder(
-                lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"]
+                lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"],
+                safety_stock_rate=rate,
             )
             risk = classify_risk(
                 lt["Current_Stock"], lt["Forecasted_Demand_During_Lead_Time"], exp.get("Days_Remaining", 999)
